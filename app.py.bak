@@ -1,0 +1,192 @@
+import os
+import tempfile
+import streamlit as st
+from gtts import gTTS
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.vectorstores import FAISS
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+
+# -----------------------------------------------------------------------------
+# Page Configuration & Custom CSS Styling (Clean Energy Theme)
+# -----------------------------------------------------------------------------
+st.set_page_config(
+    page_title="CivicPulse AI — Infrastructure & Energy Tracker",
+    page_icon="⚡",
+    layout="wide"
+)
+
+st.markdown("""
+    <style>
+    /* Theme Colors: Deep Teal (#0D9488) & Clean Green (#16A34A) */
+    .main-header {
+        font-size: 2.3rem;
+        font-weight: 800;
+        color: #0F766E;
+        margin-bottom: 0px;
+    }
+    .sub-header {
+        font-size: 1.1rem;
+        color: #374151;
+        margin-bottom: 20px;
+    }
+    .sample-chip {
+        background-color: #ECFDF5;
+        border: 1px solid #10B981;
+        border-radius: 8px;
+        padding: 8px;
+        margin-bottom: 8px;
+        font-size: 0.9rem;
+    }
+    .citation-card {
+        background-color: #F0FDF4;
+        padding: 12px;
+        border-radius: 6px;
+        border-left: 5px solid #16A34A;
+        margin-bottom: 12px;
+    }
+    .stButton>button {
+        background-color: #0D9488;
+        color: white;
+        border-radius: 6px;
+        font-weight: 600;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+# -----------------------------------------------------------------------------
+# Header & Context Section
+# -----------------------------------------------------------------------------
+st.markdown('<p class="main-header">⚡ CivicPulse AI: Energy & Infrastructure Tracker</p>', unsafe_allow_html=True)
+st.markdown(
+    '<p class="sub-header">Demystifying public energy allocations, rural solar mini-grids, and transformer spending in plain language with verifiable source citations.</p>',
+    unsafe_allow_html=True
+)
+st.divider()
+
+# -----------------------------------------------------------------------------
+# Sidebar Configuration & Sample Queries
+# -----------------------------------------------------------------------------
+with st.sidebar:
+    st.header("⚙️ Configuration")
+    api_key = st.text_input("Enter Gemini API Key", type="password")
+    uploaded_file = st.file_uploader("Upload Public Budget/Procurement (PDF)", type=["pdf"])
+    
+    st.divider()
+    st.header("🌐 Audio Output Options")
+    selected_language = st.selectbox(
+        "Select Audio Dialect/Language",
+        ["English", "Hausa", "Swahili", "Pidgin (Simplified English)", "French"]
+    )
+    
+    st.divider()
+    st.header("💡 Sample Energy Queries")
+    st.caption("Click a query below or type your own in the main panel:")
+    
+    sample_queries = [
+        "What is the total allocation for rural solar mini-grids?",
+        "Which wards are receiving new power transformers this year?",
+        "What is the budget for solar streetlight maintenance?",
+        "Are there any clean energy subsidies or grants listed?"
+    ]
+    
+    selected_sample = None
+    for q in sample_queries:
+        if st.button(q, key=f"btn_{q}"):
+            selected_sample = q
+
+# -----------------------------------------------------------------------------
+# Main Application Logic
+# -----------------------------------------------------------------------------
+if uploaded_file and api_key:
+    os.environ["GOOGLE_API_KEY"] = api_key
+    
+    # Save uploaded PDF temporarily
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+        tmp_file.write(uploaded_file.read())
+        tmp_path = tmp_file.name
+
+    @st.cache_resource(show_spinner="Indexing procurement & energy allocation chunks...")
+    def process_document(file_path):
+        loader = PyPDFLoader(file_path)
+        docs = loader.load_and_split()
+        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+        vectorstore = FAISS.from_documents(docs, embeddings)
+        return vectorstore
+
+    try:
+        vectorstore = process_document(tmp_path)
+        st.success("✅ Public document indexed successfully!")
+        
+        # Determine query string (from sample button click or text input)
+        default_text = selected_sample if selected_sample else ""
+        user_query = st.text_input(
+            "Ask a question about local energy allocations:",
+            value=default_text,
+            placeholder="e.g., How much is budgeted for rural electrification in Ward B?"
+        )
+        
+        if user_query:
+            with st.spinner("Extracting verified infrastructure allocations..."):
+                llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.2)
+                retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+                
+                # Context Retrieval
+                retrieved_docs = retriever.invoke(user_query)
+                context_text = "\n\n".join([doc.page_content for doc in retrieved_docs])
+                
+                # System Prompt Tailored for Infrastructure & Energy Tracking
+                prompt_template = f"""
+                You are a civic advisor specializing in public energy and infrastructure spending in Africa.
+                Answer the user's question using simple, everyday plain language. Target output language/style: {selected_language}.
+
+                Guidelines:
+                1. State the key amounts, project names, and target locations clearly in bullet points.
+                2. Explain any complex procurement terms (e.g., 'capital expenditure', 'matching grants') in plain words.
+                3. Keep the tone factual, accessible, and concise.
+
+                Context from public document:
+                {{context}}
+
+                Question: {{question}}
+                
+                Answer (Plain Language Breakdown):
+                """
+                
+                full_prompt = prompt_template.format(context=context_text, question=user_query)
+                response = llm.invoke(full_prompt)
+                
+                # Layout Output (2 Columns: Breakdown vs Citations)
+                col1, col2 = st.columns([3, 2])
+                
+                with col1:
+                    st.subheader("💡 Plain Language Energy Allocation Summary")
+                    st.markdown(response.content)
+                    
+                    # Audio Generation via gTTS
+                    st.subheader("🔊 Audio Summary (Low-Bandwidth Access)")
+                    tts_lang = "sw" if selected_language == "Swahili" else ("fr" if selected_language == "French" else "en")
+                    tts = gTTS(text=response.content[:350], lang=tts_lang, slow=False)
+                    
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as audio_file:
+                        tts.save(audio_file.name)
+                        st.audio(audio_file.name, format="audio/mp3")
+
+                with col2:
+                    st.subheader("📜 Verifiable Source Proof")
+                    st.caption("Direct quotes & page citations to prevent AI hallucination:")
+                    for i, doc in enumerate(retrieved_docs):
+                        page_num = doc.metadata.get("page", "N/A")
+                        st.markdown(f"""
+                        <div class="citation-card">
+                            <strong>Source Chunk {i+1} — (Page {page_num}):</strong><br>
+                            <em>"{doc.page_content[:250]}..."</em>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+    except Exception as e:
+        st.error(f"Error processing document or query: {str(e)}")
+
+elif not api_key:
+    st.info("👈 Enter your Gemini API Key in the sidebar to begin.")
+else:
+    st.info("👈 Upload a budget or procurement PDF in the sidebar to test energy tracking queries.")
